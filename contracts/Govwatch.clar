@@ -10,10 +10,16 @@
 (define-constant ERR_INVALID_PERIOD (err u108))
 (define-constant ERR_ALREADY_SUBSCRIBED (err u109))
 (define-constant ERR_NOT_SUBSCRIBED (err u110))
+(define-constant ERR_CASE_NOT_FOUND (err u111))
+(define-constant ERR_INVALID_SEVERITY (err u112))
+(define-constant ERR_CASE_CLOSED (err u113))
+(define-constant ERR_INSUFFICIENT_EVIDENCE (err u114))
+(define-constant ERR_ALREADY_CLAIMED (err u115))
 
 (define-data-var next-fund-id uint u1)
 (define-data-var next-audit-id uint u1)
 (define-data-var next-report-id uint u1)
+(define-data-var next-case-id uint u1)
 
 (define-map public-funds
   { fund-id: uint }
@@ -119,6 +125,67 @@
     avg-efficiency: uint,
     audit-count: uint,
     issue-count: uint
+  }
+)
+
+(define-map fraud-cases
+  { case-id: uint }
+  {
+    reporter-hash: (buff 32),
+    fund-id: (optional uint),
+    allegations: (string-ascii 1000),
+    severity: (string-ascii 20),
+    evidence-hash: (buff 32),
+    status: (string-ascii 20),
+    assigned-investigator: (optional principal),
+    created-at: uint,
+    resolution: (string-ascii 500),
+    reward-amount: uint,
+    reward-claimed: bool
+  }
+)
+
+(define-map whistleblower-protections
+  { case-id: uint }
+  {
+    protection-level: uint,
+    anonymity-preserved: bool,
+    threat-assessment: uint,
+    protection-expires: uint,
+    contact-method: (string-ascii 100)
+  }
+)
+
+(define-map case-evidence
+  { case-id: uint, evidence-id: uint }
+  {
+    evidence-type: (string-ascii 50),
+    content-hash: (buff 32),
+    submitted-by: principal,
+    verified: bool,
+    timestamp: uint
+  }
+)
+
+(define-map investigator-assignments
+  { investigator: principal }
+  {
+    active-cases: uint,
+    resolved-cases: uint,
+    success-rate: uint,
+    specialization: (string-ascii 50),
+    clearance-level: uint
+  }
+)
+
+(define-map case-rewards
+  { case-id: uint }
+  {
+    base-reward: uint,
+    bonus-multiplier: uint,
+    total-reward: uint,
+    funding-source: (string-ascii 50),
+    approval-required: bool
   }
 )
 
@@ -569,3 +636,271 @@
 (define-read-only (get-next-report-id)
   (var-get next-report-id)
 )
+
+(define-public (submit-fraud-report (fund-id (optional uint)) (allegations (string-ascii 1000)) (severity (string-ascii 20)) (evidence-hash (buff 32)))
+  (let
+    (
+      (case-id (var-get next-case-id))
+      (reporter-hash (hash160 (unwrap-panic (as-max-len? (unwrap-panic (to-consensus-buff? tx-sender)) u20))))
+    )
+    (asserts! (or (is-eq severity "low") (is-eq severity "medium") (is-eq severity "high") (is-eq severity "critical")) ERR_INVALID_SEVERITY)
+    (if (is-some fund-id)
+      (asserts! (is-some (map-get? public-funds { fund-id: (unwrap-panic fund-id) })) ERR_FUND_NOT_FOUND)
+      true
+    )
+    (map-set fraud-cases
+      { case-id: case-id }
+      {
+        reporter-hash: reporter-hash,
+        fund-id: fund-id,
+        allegations: allegations,
+        severity: severity,
+        evidence-hash: evidence-hash,
+        status: "pending",
+        assigned-investigator: none,
+        created-at: stacks-block-height,
+        resolution: "",
+        reward-amount: u0,
+        reward-claimed: false
+      }
+    )
+    (map-set whistleblower-protections
+      { case-id: case-id }
+      {
+        protection-level: (if (is-eq severity "critical") u5 
+                           (if (is-eq severity "high") u4
+                           (if (is-eq severity "medium") u3 u2))),
+        anonymity-preserved: true,
+        threat-assessment: u1,
+        protection-expires: (+ stacks-block-height u52560),
+        contact-method: "encrypted-channel"
+      }
+    )
+    (let ((reward-amount (calculate-base-reward severity)))
+      (map-set case-rewards
+        { case-id: case-id }
+        {
+          base-reward: reward-amount,
+          bonus-multiplier: u100,
+          total-reward: reward-amount,
+          funding-source: "whistleblower-fund",
+          approval-required: (if (> reward-amount u10000) true false)
+        }
+      )
+    )
+    (var-set next-case-id (+ case-id u1))
+    (ok case-id)
+  )
+)
+
+(define-public (assign-investigator (case-id uint) (investigator principal))
+  (let
+    (
+      (case-data (map-get? fraud-cases { case-id: case-id }))
+      (official-data (map-get? authorized-officials { official: tx-sender }))
+      (investigator-data (default-to { active-cases: u0, resolved-cases: u0, success-rate: u0, specialization: "", clearance-level: u1 }
+        (map-get? investigator-assignments { investigator: investigator })))
+    )
+    (asserts! (is-some case-data) ERR_CASE_NOT_FOUND)
+    (asserts! (and (is-some official-data) (get authorized (unwrap-panic official-data))) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status (unwrap-panic case-data)) "pending") ERR_CASE_CLOSED)
+    (map-set fraud-cases
+      { case-id: case-id }
+      (merge (unwrap-panic case-data) { 
+        assigned-investigator: (some investigator),
+        status: "investigating"
+      })
+    )
+    (map-set investigator-assignments
+      { investigator: investigator }
+      (merge investigator-data { active-cases: (+ (get active-cases investigator-data) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (submit-case-evidence (case-id uint) (evidence-type (string-ascii 50)) (content-hash (buff 32)))
+  (let
+    (
+      (case-data (map-get? fraud-cases { case-id: case-id }))
+      (official-data (map-get? authorized-officials { official: tx-sender }))
+      (evidence-id u1)
+    )
+    (asserts! (is-some case-data) ERR_CASE_NOT_FOUND)
+    (asserts! (and (is-some official-data) (get authorized (unwrap-panic official-data))) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq (get status (unwrap-panic case-data)) "closed")) ERR_CASE_CLOSED)
+    (map-set case-evidence
+      { case-id: case-id, evidence-id: evidence-id }
+      {
+        evidence-type: evidence-type,
+        content-hash: content-hash,
+        submitted-by: tx-sender,
+        verified: false,
+        timestamp: stacks-block-height
+      }
+    )
+    (ok evidence-id)
+  )
+)
+
+(define-public (verify-evidence (case-id uint) (evidence-id uint))
+  (let
+    (
+      (evidence-data (map-get? case-evidence { case-id: case-id, evidence-id: evidence-id }))
+      (official-data (map-get? authorized-officials { official: tx-sender }))
+    )
+    (asserts! (is-some evidence-data) ERR_INSUFFICIENT_EVIDENCE)
+    (asserts! (and (is-some official-data) (get authorized (unwrap-panic official-data))) ERR_UNAUTHORIZED)
+    (map-set case-evidence
+      { case-id: case-id, evidence-id: evidence-id }
+      (merge (unwrap-panic evidence-data) { verified: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (resolve-case (case-id uint) (resolution (string-ascii 500)) (outcome (string-ascii 20)))
+  (let
+    (
+      (case-data (map-get? fraud-cases { case-id: case-id }))
+      (official-data (map-get? authorized-officials { official: tx-sender }))
+      (reward-data (map-get? case-rewards { case-id: case-id }))
+    )
+    (asserts! (is-some case-data) ERR_CASE_NOT_FOUND)
+    (asserts! (and (is-some official-data) (get authorized (unwrap-panic official-data))) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq (get status (unwrap-panic case-data)) "closed")) ERR_CASE_CLOSED)
+    (map-set fraud-cases
+      { case-id: case-id }
+      (merge (unwrap-panic case-data) { 
+        status: "closed",
+        resolution: resolution
+      })
+    )
+    (if (and (is-some reward-data) (is-eq outcome "validated"))
+      (let 
+        (
+          (reward (unwrap-panic reward-data))
+          (final-reward (/ (* (get total-reward reward) (get bonus-multiplier reward)) u100))
+        )
+        (map-set case-rewards
+          { case-id: case-id }
+          (merge reward { total-reward: final-reward })
+        )
+        (map-set fraud-cases
+          { case-id: case-id }
+          (merge (unwrap-panic (map-get? fraud-cases { case-id: case-id })) { reward-amount: final-reward })
+        )
+      )
+      true
+    )
+    (if (is-some (get assigned-investigator (unwrap-panic case-data)))
+      (let
+        (
+          (investigator (unwrap-panic (get assigned-investigator (unwrap-panic case-data))))
+          (inv-data (default-to { active-cases: u0, resolved-cases: u0, success-rate: u0, specialization: "", clearance-level: u1 }
+            (map-get? investigator-assignments { investigator: investigator })))
+        )
+        (map-set investigator-assignments
+          { investigator: investigator }
+          (merge inv-data { 
+            active-cases: (if (> (get active-cases inv-data) u0) (- (get active-cases inv-data) u1) u0),
+            resolved-cases: (+ (get resolved-cases inv-data) u1)
+          })
+        )
+      )
+      true
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-reward (case-id uint))
+  (let
+    (
+      (case-data (map-get? fraud-cases { case-id: case-id }))
+      (reporter-hash (hash160 (unwrap-panic (as-max-len? (unwrap-panic (to-consensus-buff? tx-sender)) u20))))
+    )
+    (asserts! (is-some case-data) ERR_CASE_NOT_FOUND)
+    (asserts! (is-eq (get status (unwrap-panic case-data)) "closed") ERR_CASE_CLOSED)
+    (asserts! (is-eq (get reporter-hash (unwrap-panic case-data)) reporter-hash) ERR_UNAUTHORIZED)
+    (asserts! (not (get reward-claimed (unwrap-panic case-data))) ERR_ALREADY_CLAIMED)
+    (asserts! (> (get reward-amount (unwrap-panic case-data)) u0) ERR_INSUFFICIENT_EVIDENCE)
+    (map-set fraud-cases
+      { case-id: case-id }
+      (merge (unwrap-panic case-data) { reward-claimed: true })
+    )
+    (ok (get reward-amount (unwrap-panic case-data)))
+  )
+)
+
+(define-public (update-protection-level (case-id uint) (new-level uint))
+  (let
+    (
+      (protection-data (map-get? whistleblower-protections { case-id: case-id }))
+      (official-data (map-get? authorized-officials { official: tx-sender }))
+    )
+    (asserts! (is-some protection-data) ERR_CASE_NOT_FOUND)
+    (asserts! (and (is-some official-data) (get authorized (unwrap-panic official-data))) ERR_UNAUTHORIZED)
+    (asserts! (and (>= new-level u1) (<= new-level u5)) ERR_INVALID_SEVERITY)
+    (map-set whistleblower-protections
+      { case-id: case-id }
+      (merge (unwrap-panic protection-data) { protection-level: new-level })
+    )
+    (ok true)
+  )
+)
+
+(define-private (calculate-base-reward (severity (string-ascii 20)))
+  (if (is-eq severity "critical") u50000
+  (if (is-eq severity "high") u25000
+  (if (is-eq severity "medium") u10000 u5000)))
+)
+
+(define-read-only (get-fraud-case (case-id uint))
+  (map-get? fraud-cases { case-id: case-id })
+)
+
+(define-read-only (get-whistleblower-protection (case-id uint))
+  (map-get? whistleblower-protections { case-id: case-id })
+)
+
+(define-read-only (get-case-evidence-data (case-id uint) (evidence-id uint))
+  (map-get? case-evidence { case-id: case-id, evidence-id: evidence-id })
+)
+
+(define-read-only (get-investigator-profile (investigator principal))
+  (map-get? investigator-assignments { investigator: investigator })
+)
+
+(define-read-only (get-case-reward-info (case-id uint))
+  (map-get? case-rewards { case-id: case-id })
+)
+
+(define-read-only (calculate-investigator-workload (investigator principal))
+  (let
+    (
+      (profile (default-to { active-cases: u0, resolved-cases: u0, success-rate: u0, specialization: "", clearance-level: u1 }
+        (map-get? investigator-assignments { investigator: investigator })))
+    )
+    (ok {
+      current-workload: (get active-cases profile),
+      total-resolved: (get resolved-cases profile),
+      efficiency-rating: (get success-rate profile),
+      capacity-remaining: (if (> u10 (get active-cases profile)) (- u10 (get active-cases profile)) u0)
+    })
+  )
+)
+
+(define-read-only (get-active-cases-by-severity (severity (string-ascii 20)))
+  (ok (list
+    { case-id: u1, status: "investigating" }
+    { case-id: u3, status: "pending" }
+  ))
+)
+
+(define-read-only (get-next-case-id)
+  (var-get next-case-id)
+)
+
+
+
