@@ -15,11 +15,15 @@
 (define-constant ERR_CASE_CLOSED (err u113))
 (define-constant ERR_INSUFFICIENT_EVIDENCE (err u114))
 (define-constant ERR_ALREADY_CLAIMED (err u115))
+(define-constant ERR_AMENDMENT_NOT_FOUND (err u116))
+(define-constant ERR_AMENDMENT_CLOSED (err u117))
+(define-constant ERR_INVALID_AMENDMENT_TYPE (err u118))
 
 (define-data-var next-fund-id uint u1)
 (define-data-var next-audit-id uint u1)
 (define-data-var next-report-id uint u1)
 (define-data-var next-case-id uint u1)
+(define-data-var next-amendment-id uint u1)
 
 (define-map public-funds
   { fund-id: uint }
@@ -186,6 +190,44 @@
     total-reward: uint,
     funding-source: (string-ascii 50),
     approval-required: bool
+  }
+)
+
+;; Budget Amendment Tracking System
+(define-map budget-amendments
+  { amendment-id: uint }
+  {
+    fund-id: uint,
+    proposed-amount: uint,
+    current-amount: uint,
+    amendment-type: (string-ascii 20), ;; "increase", "decrease", "reallocation"
+    justification: (string-ascii 500),
+    proposer: principal,
+    status: (string-ascii 20), ;; "pending", "approved", "rejected", "expired"
+    votes-for: uint,
+    votes-against: uint,
+    min-votes-required: uint,
+    created-at: uint,
+    expires-at: uint,
+    reviewed-by: (optional principal),
+    review-notes: (string-ascii 300)
+  }
+)
+
+(define-map amendment-votes
+  { amendment-id: uint, voter: principal }
+  { vote: bool, vote-weight: uint, timestamp: uint }
+)
+
+(define-map amendment-history
+  { fund-id: uint, change-id: uint }
+  {
+    amendment-id: uint,
+    previous-amount: uint,
+    new-amount: uint,
+    reason: (string-ascii 500),
+    approved-by: principal,
+    effective-date: uint
   }
 )
 
@@ -902,5 +944,191 @@
   (var-get next-case-id)
 )
 
+;; Budget Amendment Functions
+(define-public (propose-budget-amendment (fund-id uint) (proposed-amount uint) (amendment-type (string-ascii 20)) (justification (string-ascii 500)))
+  (let
+    (
+      (amendment-id (var-get next-amendment-id))
+      (fund-data (map-get? public-funds { fund-id: fund-id }))
+    )
+    (asserts! (is-some fund-data) ERR_FUND_NOT_FOUND)
+    (asserts! (> proposed-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (or (is-eq amendment-type "increase") (is-eq amendment-type "decrease") (is-eq amendment-type "reallocation")) ERR_INVALID_AMENDMENT_TYPE)
+    (let
+      (
+        (fund (unwrap-panic fund-data))
+        (current-amount (get allocated-amount fund))
+        (min-votes (if (> (/ current-amount u100000) u3) (/ current-amount u100000) u3)) ;; Minimum 3 votes or 1 per 100k allocated
+      )
+      (map-set budget-amendments
+        { amendment-id: amendment-id }
+        {
+          fund-id: fund-id,
+          proposed-amount: proposed-amount,
+          current-amount: current-amount,
+          amendment-type: amendment-type,
+          justification: justification,
+          proposer: tx-sender,
+          status: "pending",
+          votes-for: u0,
+          votes-against: u0,
+          min-votes-required: min-votes,
+          created-at: stacks-block-height,
+          expires-at: (+ stacks-block-height u1440), ;; Expires in ~10 days
+          reviewed-by: none,
+          review-notes: ""
+        }
+      )
+      (var-set next-amendment-id (+ amendment-id u1))
+      (ok amendment-id)
+    )
+  )
+)
 
+(define-public (vote-on-amendment (amendment-id uint) (vote bool))
+  (let
+    (
+      (amendment-data (map-get? budget-amendments { amendment-id: amendment-id }))
+      (existing-vote (map-get? amendment-votes { amendment-id: amendment-id, voter: tx-sender }))
+    )
+    (asserts! (is-some amendment-data) ERR_AMENDMENT_NOT_FOUND)
+    (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+    (let
+      (
+        (amendment (unwrap-panic amendment-data))
+      )
+      (asserts! (is-eq (get status amendment) "pending") ERR_AMENDMENT_CLOSED)
+      (asserts! (< stacks-block-height (get expires-at amendment)) ERR_AMENDMENT_CLOSED)
+      (let
+        (
+          (vote-weight u1) ;; Could be enhanced with reputation-based weighting
+          (new-votes-for (if vote (+ (get votes-for amendment) vote-weight) (get votes-for amendment)))
+          (new-votes-against (if vote (get votes-against amendment) (+ (get votes-against amendment) vote-weight)))
+        )
+        (map-set budget-amendments
+          { amendment-id: amendment-id }
+          (merge amendment {
+            votes-for: new-votes-for,
+            votes-against: new-votes-against
+          })
+        )
+        (map-set amendment-votes
+          { amendment-id: amendment-id, voter: tx-sender }
+          { vote: vote, vote-weight: vote-weight, timestamp: stacks-block-height }
+        )
+        (ok true)
+      )
+    )
+  )
+)
 
+(define-public (approve-amendment (amendment-id uint) (review-notes (string-ascii 300)))
+  (let
+    (
+      (amendment-data (map-get? budget-amendments { amendment-id: amendment-id }))
+      (official-data (map-get? authorized-officials { official: tx-sender }))
+    )
+    (asserts! (is-some amendment-data) ERR_AMENDMENT_NOT_FOUND)
+    (asserts! (and (is-some official-data) (get authorized (unwrap-panic official-data))) ERR_UNAUTHORIZED)
+    (let
+      (
+        (amendment (unwrap-panic amendment-data))
+      )
+      (asserts! (is-eq (get status amendment) "pending") ERR_AMENDMENT_CLOSED)
+      (asserts! (>= (get votes-for amendment) (get min-votes-required amendment)) ERR_INVALID_STATUS)
+      (asserts! (> (get votes-for amendment) (get votes-against amendment)) ERR_INVALID_STATUS)
+      ;; Update the fund allocation
+      (let
+        (
+          (fund-data (unwrap-panic (map-get? public-funds { fund-id: (get fund-id amendment) })))
+          (change-id u1) ;; Simplified - could be tracked per fund
+        )
+        (map-set public-funds
+          { fund-id: (get fund-id amendment) }
+          (merge fund-data { allocated-amount: (get proposed-amount amendment) })
+        )
+        ;; Record the change in history
+        (map-set amendment-history
+          { fund-id: (get fund-id amendment), change-id: change-id }
+          {
+            amendment-id: amendment-id,
+            previous-amount: (get current-amount amendment),
+            new-amount: (get proposed-amount amendment),
+            reason: (get justification amendment),
+            approved-by: tx-sender,
+            effective-date: stacks-block-height
+          }
+        )
+        ;; Update amendment status
+        (map-set budget-amendments
+          { amendment-id: amendment-id }
+          (merge amendment {
+            status: "approved",
+            reviewed-by: (some tx-sender),
+            review-notes: review-notes
+          })
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-public (reject-amendment (amendment-id uint) (review-notes (string-ascii 300)))
+  (let
+    (
+      (amendment-data (map-get? budget-amendments { amendment-id: amendment-id }))
+      (official-data (map-get? authorized-officials { official: tx-sender }))
+    )
+    (asserts! (is-some amendment-data) ERR_AMENDMENT_NOT_FOUND)
+    (asserts! (and (is-some official-data) (get authorized (unwrap-panic official-data))) ERR_UNAUTHORIZED)
+    (let
+      (
+        (amendment (unwrap-panic amendment-data))
+      )
+      (asserts! (is-eq (get status amendment) "pending") ERR_AMENDMENT_CLOSED)
+      (map-set budget-amendments
+        { amendment-id: amendment-id }
+        (merge amendment {
+          status: "rejected",
+          reviewed-by: (some tx-sender),
+          review-notes: review-notes
+        })
+      )
+      (ok true)
+    )
+  )
+)
+
+;; Read-only functions for Budget Amendments
+(define-read-only (get-budget-amendment (amendment-id uint))
+  (map-get? budget-amendments { amendment-id: amendment-id })
+)
+
+(define-read-only (get-amendment-vote (amendment-id uint) (voter principal))
+  (map-get? amendment-votes { amendment-id: amendment-id, voter: voter })
+)
+
+(define-read-only (get-amendment-history (fund-id uint) (change-id uint))
+  (map-get? amendment-history { fund-id: fund-id, change-id: change-id })
+)
+
+(define-read-only (get-next-amendment-id)
+  (var-get next-amendment-id)
+)
+
+(define-read-only (check-amendment-eligibility (amendment-id uint))
+  (match (map-get? budget-amendments { amendment-id: amendment-id })
+    amendment
+    (ok {
+      is-active: (and (is-eq (get status amendment) "pending") (< stacks-block-height (get expires-at amendment))),
+      vote-threshold-met: (>= (get votes-for amendment) (get min-votes-required amendment)),
+      community-support: (> (get votes-for amendment) (get votes-against amendment)),
+      ready-for-review: (and 
+        (>= (get votes-for amendment) (get min-votes-required amendment))
+        (> (get votes-for amendment) (get votes-against amendment))
+      )
+    })
+    ERR_AMENDMENT_NOT_FOUND
+  )
+)
